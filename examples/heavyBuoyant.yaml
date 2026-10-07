@@ -1,0 +1,35 @@
+apiVersion: foam-clutch/v1alpha1
+name: heavyBuoyant
+
+case:
+  path: /home/shared/openfoam/heavyBuoyant
+
+resources:
+  partition: normal
+  account: ""
+  nodes: 2
+  tasksPerNode: 4
+  timeLimitMinutes: 60
+
+solver:
+  name: foamRun   # same runner executable as heavySimple; controlDict solver is "fluid" (buoyant)
+  arguments: []
+  fileHandler: collated
+  checkpointSeconds: 600
+
+mesh:
+  strategy: auto
+
+post:
+  reconstruct: false
+
+runtime:
+  foamBashrc: /opt/openfoam12/etc/bashrc
+  threadsPerRank: 1
+  mpi:
+    launcher: mpirun
+    flavour: ""
+
+storage:
+  cacheDir: /home/shared/openfoam/heavyBuoyant/.foam-cache
+  runDir: /home/shared/openfoam/heavyBuoyant/.foam-runs

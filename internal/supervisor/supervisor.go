@@ -33,9 +33,11 @@ func (s *Supervisor) maxUnknown() int {
 // Terminal states (DONE/FAILED/CANCELLED) stop Watch. REQUEUED-class states
 // (TIMEOUT, PREEMPTED, NODE_FAIL, ...) keep polling: Slurm will requeue the
 // job when --requeue is set and the solver asked for a writeNow checkpoint.
+// The mapping is solver-agnostic: it depends only on Slurm states, never on
+// which OpenFOAM executable ran inside the allocation.
 func slurmToLocal(state string) string {
 	switch state {
-	case "PENDING", "SUSPENDED":
+	case "PENDING", "SUSPENDED", "CONFIGURING":
 		return "QUEUED"
 	case "RUNNING", "COMPLETING":
 		return "RUNNING"
@@ -45,12 +47,16 @@ func slurmToLocal(state string) string {
 		return "FAILED"
 	case "CANCELLED":
 		return "CANCELLED"
-	case "TIMEOUT", "PREEMPTED", "NODE_FAIL", "REVOKED", "RESIZING":
+	case "TIMEOUT", "PREEMPTED", "NODE_FAIL", "REVOKED", "RESIZING", "SPECIAL_EXIT":
 		return "REQUEUED"
 	default:
 		return state
 	}
 }
+
+// ToLocal maps a raw Slurm state to the local state machine. It is the
+// exported form of slurmToLocal for CLI/API single-shot refresh paths.
+func ToLocal(state string) string { return slurmToLocal(state) }
 
 func (s *Supervisor) Watch(ctx context.Context, localID string, slurmID int) error {
 	if s.Scheduler == nil || s.Store == nil {
@@ -71,6 +77,9 @@ func (s *Supervisor) Watch(ctx context.Context, localID string, slurmID int) err
 		states, err := s.Scheduler.State(ctx, slurmID)
 		if err != nil {
 			unknown++
+			if s.Metrics != nil {
+				s.Metrics.WatchErrors.Add(1)
+			}
 			_ = s.Store.UpdateState(ctx, localID, "UNKNOWN", err.Error(), slurmID)
 			if unknown >= s.maxUnknown() {
 				return false, fmt.Errorf("slurm job %d unobservable after %d polls: %w", slurmID, unknown, err)
@@ -82,13 +91,24 @@ func (s *Supervisor) Watch(ctx context.Context, localID string, slurmID int) err
 			return false, nil
 		}
 		local := slurmToLocal(states[0])
-		if local == "REQUEUED" && s.Metrics != nil {
-			s.Metrics.Requeues.Add(1)
+		if s.Metrics != nil {
+			switch local {
+			case "REQUEUED":
+				s.Metrics.Requeues.Add(1)
+			case "DONE":
+				s.Metrics.JobsDone.Add(1)
+			case "FAILED":
+				s.Metrics.JobsFailed.Add(1)
+			case "CANCELLED":
+				s.Metrics.JobsCancelled.Add(1)
+			}
 		}
 		_ = s.Store.UpdateState(ctx, localID, local, "", slurmID)
 		if local == "DONE" || local == "FAILED" || local == "CANCELLED" {
 			return true, nil
 		}
+		// Unknown future Slurm states are recorded verbatim and polling
+		// continues so an upgrade never wedges the supervisor.
 		return false, nil
 	}
 	if done, err := poll(); err != nil {

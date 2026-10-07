@@ -1,60 +1,104 @@
 #!/bin/bash
 {{- /*
-  Rendered with Go text/template. Fields:
-    Name, Nodes, PPN, Ranks, WallTime (HH:MM:SS), Partition, Account,
-    CaseDir, Solver, SolverArgs, FoamBashrc
-    Container (bool), SIF, BindPaths
+  Standalone Slurm batch template. Render with Go text/template.
+  It mirrors what the service generates programmatically from a manifest,
+  so the two must stay in sync (mesh -> decompose -> solver -> post ->
+  checkpoint/requeue). Nothing about the physics is hard-coded here: the
+  solver executable, its arguments, the file handler, the MPI launcher, the
+  mesh strategy, post steps, container image, OpenFOAM environment,
+  checkpoint interval, and extra SBATCH lines are all template fields fed
+  from the manifest. heavySimple (incompressibleFluid via foamRun),
+  heavyBuoyant (fluid via foamRun), and any other OpenFOAM project render
+  through the same fields.
+
+  Fields:
+    Name, Partition, Account, Nodes, PPN, Ranks, WallTime (HH:MM:SS),
+    CaseDir, Solver, SolverArgs (already shell-quoted, joined),
+    ParallelFlag ("" or " -parallel"), FileHandlerFlag ("" or " -fileHandler ..."),
+    FoamBashrc, ThreadsPerRank,
+    Launcher ("mpirun" or "srun"), Flavour (srun --mpi value, may be ""),
+    MpiExtraArgs (already shell-quoted, joined, may be ""),
+    MeshStrategy ("auto", "blockMesh", "custom", "none"),
+    MeshCommands (list of shell snippets),
+    PostReconstruct (bool), PostCommands (list of shell snippets),
+    CheckpointSeconds (0 disables signal/trap/requeue),
+    Container (bool), SIF, BindPath,
+    SbatchExtra (list of raw "--key[=value]" lines)
+
   When submitted via slurmrestd, set the equivalent job fields in JobSpec
   (and anything unmodelled via JobSpec.Extra): do not rely on #SBATCH lines
   being parsed there. For the sbatch CLI backend these lines are authoritative.
-  The service generates an equivalent script programmatically; keep the two
-  in sync (mesh -> decompose -> solver -> requeue).
 */}}
 #SBATCH --job-name={{.Name}}
-#SBATCH --partition={{.Partition}}
-{{if .Account}}#SBATCH --account={{.Account}}
+{{if .Partition}}#SBATCH --partition={{.Partition}}
+{{end}}{{if .Account}}#SBATCH --account={{.Account}}
 {{end}}#SBATCH --nodes={{.Nodes}}
 #SBATCH --ntasks-per-node={{.PPN}}
 #SBATCH --ntasks={{.Ranks}}
 #SBATCH --time={{.WallTime}}
 #SBATCH --exclusive
 #SBATCH --hint=nomultithread
-#SBATCH --requeue
-#SBATCH --signal=B:USR1@600
-#SBATCH --output={{.CaseDir}}/slurm-%j.out
+{{if .CheckpointSeconds}}#SBATCH --requeue
+#SBATCH --signal=B:USR1@{{.CheckpointSeconds}}
+{{end}}{{range .SbatchExtra}}#SBATCH {{.}}
+{{end}}#SBATCH --output={{.CaseDir}}/slurm-%j.out
 #SBATCH --error={{.CaseDir}}/slurm-%j.err
 set -euo pipefail
 echo "=== foam-clutch job: {{.Name}} ==="
+echo "solver={{.Solver}} ranks={{.Ranks}} wall={{.WallTime}} mesh={{.MeshStrategy}} launcher={{.Launcher}}"
 date; echo "nodelist: ${SLURM_NODELIST:-unknown} job: ${SLURM_JOB_ID:-unknown}"
 
 set +e +u
 source {{.FoamBashrc}}
 set -e -u
-export OMP_NUM_THREADS=1
+echo "OpenFOAM ${WM_PROJECT_VERSION:-unknown} at ${WM_PROJECT_DIR:-unknown}"
+export OMP_NUM_THREADS={{.ThreadsPerRank}}
 BASHRC={{.FoamBashrc}}
 
 {{if .Container -}}
 SIF={{.SIF}}
-BIND={{.BindPaths}}
+BIND={{.BindPath}}
 foam_serial() { apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && $*"; }
-foam_mpi()    { srun --mpi=pmix --cpu-bind=cores \
+{{if eq .Launcher "srun"}}foam_mpi()    { srun{{if .Flavour}} --mpi={{.Flavour}}{{end}} --cpu-bind=cores{{if .MpiExtraArgs}} {{.MpiExtraArgs}}{{end}} \
                   apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && exec $*"; }
-{{- else -}}
+{{else}}foam_mpi()    { mpirun -np "${NTASKS:-{{.Ranks}}}"{{if .MpiExtraArgs}} {{.MpiExtraArgs}}{{end}} \
+                  apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && exec $*"; }
+{{end}}{{- else -}}
 foam_serial() { bash -c "source $BASHRC && $*"; }
-foam_mpi()    { mpirun -np "${NTASKS:-{{.Ranks}}}" bash -c "source $BASHRC && exec $*"; }
-{{- end}}
+{{if eq .Launcher "srun"}}foam_mpi()    { srun{{if .Flavour}} --mpi={{.Flavour}}{{end}} --cpu-bind=cores{{if .MpiExtraArgs}} {{.MpiExtraArgs}}{{end}} bash -c "source $BASHRC && exec $*"; }
+{{else}}foam_mpi()    { mpirun -np "${NTASKS:-{{.Ranks}}}"{{if .MpiExtraArgs}} {{.MpiExtraArgs}}{{end}} bash -c "source $BASHRC && exec $*"; }
+{{end}}{{- end}}
 
 cd {{.CaseDir}}
 
-if [ ! -f constant/polyMesh/points ]; then
-  echo "--- blockMesh ---"
-  foam_serial "blockMesh" 2>&1 | tee log.blockMesh
+# --- mesh (strategy from manifest) ---
+{{if eq .MeshStrategy "none"}}echo "--- mesh skipped (strategy none) ---"
+{{else if eq .MeshStrategy "blockMesh"}}echo "--- blockMesh (strategy blockMesh) ---"
+foam_serial 'blockMesh' 2>&1 | tee log.blockMesh
+{{else if eq .MeshStrategy "custom"}}if [ ! -f constant/polyMesh/points ]; then
+{{range .MeshCommands}}  foam_serial '{{.}}' 2>&1 | tee -a log.mesh
+{{end}}else
+  echo "--- mesh skipped (constant/polyMesh exists) ---"
+fi
+{{else}}if [ ! -f constant/polyMesh/points ]; then
+  if [ -f system/blockMeshDict ]; then
+    echo "--- blockMesh (auto) ---"
+    foam_serial 'blockMesh' 2>&1 | tee log.blockMesh
+  else
+    echo "ERROR: no constant/polyMesh and no system/blockMeshDict (strategy auto)" >&2
+    exit 1
+  fi
 else
   echo "--- blockMesh skipped (constant/polyMesh exists) ---"
 fi
-
+{{end}}
+{{if eq .Ranks 1}}
+echo "--- decomposePar skipped (serial run, ranks=1) ---"
+{{else}}
+echo "--- decomposePar check ---"
 NPROC=$(grep -E "^numberOfSubdomains" system/decomposeParDict | grep -o "[0-9]*")
 NTASKS=${SLURM_NTASKS:-{{.Ranks}}}
+echo "numberOfSubdomains=$NPROC NTASKS=$NTASKS"
 if [ "$NPROC" != "$NTASKS" ]; then
   echo "ERROR: decomposeParDict($NPROC) != ntasks($NTASKS)" >&2
   exit 1
@@ -66,21 +110,39 @@ HAVE_PROC=${#PROC_DIRS[@]}
 shopt -u nullglob
 if [ "$HAVE_PROC" != "$NTASKS" ]; then
   rm -rf processor* 2>/dev/null || true
-  foam_serial "decomposePar" 2>&1 | tee log.decomposePar
+  foam_serial 'decomposePar' 2>&1 | tee log.decomposePar
 else
   echo "--- decomposePar skipped ($HAVE_PROC processor dirs) ---"
 fi
-
-trap 'foam_serial "foamDictionary -entry stopAt -set writeNow system/controlDict"; touch .foam-checkpoint-requested' USR1
-foam_serial "foamDictionary -entry startFrom -set latestTime system/controlDict" || true
+{{end}}
+{{if .CheckpointSeconds}}
+checkpoint() {
+  echo "USR1 received: requesting writeNow checkpoint"
+  foam_serial 'foamDictionary -entry stopAt -set writeNow system/controlDict' || true
+  touch .foam-checkpoint-requested
+}
+trap checkpoint USR1
+{{end}}
+if [ -f system/controlDict ]; then
+  foam_serial 'foamDictionary -entry startFrom -set latestTime system/controlDict' || true
+fi
 
 set +e
-foam_mpi "{{.Solver}} {{.SolverArgs}} -parallel -fileHandler collated" > log.solver 2>&1
-SOLVER_RC=$?
+{{if eq .Ranks 1}}foam_serial '{{.Solver}}{{if .SolverArgs}} {{.SolverArgs}}{{end}}{{.ParallelFlag}}{{.FileHandlerFlag}}' > log.solver 2>&1
+{{else}}foam_mpi '{{.Solver}}{{if .SolverArgs}} {{.SolverArgs}}{{end}}{{.ParallelFlag}}{{.FileHandlerFlag}}' > log.solver 2>&1
+{{end}}SOLVER_RC=$?
 set -e
 echo "solver exit: $SOLVER_RC"
 tail -n 20 log.solver || true
-if [ -f .foam-checkpoint-requested ] && [ -n "${SLURM_JOB_ID:-}" ]; then
+{{if .CheckpointSeconds}}if [ -f .foam-checkpoint-requested ] && [ -n "${SLURM_JOB_ID:-}" ]; then
   scontrol requeue "$SLURM_JOB_ID"
+fi
+{{end}}
+if [ "$SOLVER_RC" -eq 0 ] && [ ! -f .foam-checkpoint-requested ]; then
+{{if .PostReconstruct}}  foam_serial 'reconstructPar' 2>&1 | tee log.reconstructPar || echo "reconstructPar warning (check log)"
+{{end}}{{range .PostCommands}}  foam_serial '{{.}}' 2>&1 | tee -a log.post
+{{end}}{{if and (not .PostReconstruct) (not .PostCommands)}}  echo "--- post skipped (no reconstruct/commands) ---"
+{{end}}else
+  echo "--- post skipped (solver rc=$SOLVER_RC or checkpoint requested) ---"
 fi
 exit $SOLVER_RC

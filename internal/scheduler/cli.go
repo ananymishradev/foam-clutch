@@ -13,15 +13,16 @@ import (
 	slurmrest "github.com/ananymishradev/foam-clutch"
 )
 
-// CliScheduler submits and polls via sbatch/squeue/scontrol/scancel.
+// CliScheduler submits and polls via sbatch/squeue/scontrol/sacct/scancel.
 // It implements slurmrest.Scheduler so the service never knows which
 // backend is in use. Prefer it whenever slurmrestd is unavailable.
 type CliScheduler struct {
-	// Sbatch, Squeue, Scontrol, Scancel override binary names (tests).
+	// Sbatch, Squeue, Scontrol, Scancel, Sacct override binary names (tests).
 	Sbatch   string
 	Squeue   string
 	Scontrol string
 	Scancel  string
+	Sacct    string
 }
 
 func (c *CliScheduler) bin(name, override string) string {
@@ -77,18 +78,36 @@ func (c *CliScheduler) State(ctx context.Context, jobID int) ([]string, error) {
 		}
 	}
 	// scontrol still knows recently finished jobs (MinJobAge, ~5 min).
-	out, err := exec.CommandContext(ctx, c.bin("scontrol", c.Scontrol),
-		"show", "job", strconv.Itoa(jobID)).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("job %d not in slurmctld (finished long ago? query slurmdb/sacct)", jobID)
+	if out, err := exec.CommandContext(ctx, c.bin("scontrol", c.Scontrol),
+		"show", "job", strconv.Itoa(jobID)).CombinedOutput(); err == nil {
+		for _, field := range strings.Fields(string(out)) {
+			if strings.HasPrefix(field, "JobState=") {
+				st := strings.TrimPrefix(field, "JobState=")
+				return []string{st}, nil
+			}
+		}
+		return nil, fmt.Errorf("job %d state not found in scontrol output", jobID)
 	}
-	for _, field := range strings.Fields(string(out)) {
-		if strings.HasPrefix(field, "JobState=") {
-			st := strings.TrimPrefix(field, "JobState=")
-			return []string{st}, nil
+	// sacct (accounting) is the last resort for finished jobs once slurmctld
+	// forgets them. It is unavailable when accounting storage is disabled;
+	// in that case the job is genuinely unobservable and callers record
+	// UNKNOWN and retry with a bounded poll budget.
+	if out, err := exec.CommandContext(ctx, c.bin("sacct", c.Sacct),
+		"-j", strconv.Itoa(jobID), "-n", "-P", "-o", "State").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			st := strings.TrimSpace(strings.SplitN(line, "|", 2)[0])
+			if st == "" {
+				continue
+			}
+			// sacct prints compound states like "COMPLETED", "FAILED",
+			// "CANCELLED by 1000", "TIMEOUT". The first word is the Slurm
+			// state the supervisor maps.
+			if w := strings.Fields(st); len(w) > 0 {
+				return []string{w[0]}, nil
+			}
 		}
 	}
-	return nil, fmt.Errorf("job %d state not found in scontrol output", jobID)
+	return nil, fmt.Errorf("job %d not in slurmctld (finished long ago? query slurmdb/sacct)", jobID)
 }
 
 func (c *CliScheduler) Cancel(ctx context.Context, jobID int) error {
