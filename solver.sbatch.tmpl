@@ -1,0 +1,46 @@
+#!/bin/bash
+{{- /*
+  Rendered with Go text/template. Fields:
+    Name, Nodes, PPN, WallTime (HH:MM:SS), CaseDir, Solver, IORanks, FoamBashrc
+    Container (bool), SIF, BindPaths
+  When submitted via slurmrestd, set the equivalent job fields in JobSpec
+  (and anything unmodelled via JobSpec.Extra): do not rely on #SBATCH lines
+  being parsed there. For the sbatch CLI backend these lines are authoritative.
+*/}}
+#SBATCH --job-name={{.Name}}
+#SBATCH --nodes={{.Nodes}}
+#SBATCH --ntasks-per-node={{.PPN}}
+#SBATCH --time={{.WallTime}}
+#SBATCH --exclusive
+#SBATCH --hint=nomultithread
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@600
+set -euo pipefail
+
+cd {{.CaseDir}}
+export OMP_NUM_THREADS=1
+export FOAM_IORANKS='{{.IORanks}}'
+BASHRC={{.FoamBashrc}}
+
+{{if .Container -}}
+# ---- container mode (Apptainer) -------------------------------------------
+SIF={{.SIF}}
+BIND={{.BindPaths}}
+foam_serial() { apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && $*"; }
+foam_mpi()    { srun --mpi=pmix --cpu-bind=cores \
+                  apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && exec $*"; }
+{{- else -}}
+# ---- bare-metal mode (host OpenFOAM) --------------------------------------
+foam_serial() { bash -c "source $BASHRC && $*"; }
+foam_mpi()    { srun --mpi=pmix --cpu-bind=cores bash -c "source $BASHRC && exec $*"; }
+{{- end}}
+
+# Slurm sends USR1 to the batch shell 10 min before walltime: ask OpenFOAM to
+# write and stop cleanly (needs runTimeModifiable true, the default). The
+# Supervisor then resubmits with startFrom latestTime.
+trap 'foam_serial "foamDictionary -entry stopAt -set writeNow system/controlDict"' USR1
+
+foam_mpi "{{.Solver}} -parallel -fileHandler collated" > log.solver 2>&1 &
+PID=$!
+wait $PID || true   # returns early if the trap fired
+wait $PID           # real exit status of the solver

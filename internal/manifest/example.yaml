@@ -1,0 +1,16 @@
+apiVersion: foam-clutch/v1alpha1
+name: cavity
+case:
+  path: ./case
+resources:
+  partition: compute
+  account: research
+  nodes: 1
+  tasksPerNode: 8
+  timeLimitMinutes: 60
+solver:
+  name: simpleFoam
+  checkpointSeconds: 600
+storage:
+  cacheDir: ./.foam-cache
+  runDir: ./.foam-runs

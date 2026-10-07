@@ -1,0 +1,47 @@
+Bootstrap: docker
+From: opencfd/openfoam-run:{{ OF_VERSION }}
+
+# Build (needs Apptainer >= 1.2 for template arguments; root or --fakeroot):
+#   apptainer build --fakeroot openfoam.sif openfoam.def
+#   apptainer build --fakeroot --build-arg OF_VERSION=2512 openfoam.sif openfoam.def
+#
+# Tags currently published for opencfd/openfoam-run/-default include 2506 and
+# 2512 (check Docker Hub before pinning). This is the ESI/OpenCFD flavour.
+# If AM PravaH targets the Foundation flavour (openfoam.org), swap the
+# From: line for the matching openfoam/openfoam<N>-paraview image and change
+# FOAM_BASHRC below; everything else stays the same.
+
+%arguments
+    OF_VERSION=2506
+
+%labels
+    Maintainer pravah-runner
+    OpenFOAM {{ OF_VERSION }}
+
+%environment
+    export FOAM_BASHRC=/usr/lib/openfoam/openfoam{{ OF_VERSION }}/etc/bashrc
+    export OMP_NUM_THREADS=1
+
+%post
+    # Keep the image small and immutable. Case data is bind-mounted at run time;
+    # never bake user cases into the image.
+    mkdir -p /scratch /cases
+
+    # ------------------------------------------------------------------
+    # MPI (the part that decides multi-node performance) - see README notes:
+    #  Option A (this file): use the MPI shipped in the image + srun --mpi=pmix.
+    #     Works only if the image's OpenMPI speaks the same PMIx as the host
+    #     Slurm. Check inside the image:  ompi_info | grep -i pmix
+    #  Option B: rebuild OpenFOAM here against an MPI of the SAME family and
+    #     major version as the host (and UCX/OFI libs for your fabric), then
+    #     use the hybrid model. Highest performance, highest maintenance.
+    #  Option C: do not containerize multi-node solver runs; use the container
+    #     for preprocess/post and a host-installed OpenFOAM for the solver.
+    # ------------------------------------------------------------------
+
+%runscript
+    # apptainer run openfoam.sif simpleFoam -parallel
+    exec bash -c 'source "$FOAM_BASHRC" && exec "$@"' bash "$@"
+
+%test
+    bash -c 'source "$FOAM_BASHRC" && command -v blockMesh && command -v decomposePar && command -v foamDictionary'
