@@ -36,8 +36,12 @@ func TestSubmitStagesPersistsAndBuildsCheckpointScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifestPath := filepath.Join(root, "manifest.yaml")
-	data := []byte("apiVersion: foam-clutch/v1alpha1\nname: test\ncase:\n  path: ./case\nresources:\n  nodes: 1\n  tasksPerNode: 1\n  timeLimitMinutes: 5\nsolver:\n  name: simpleFoam\nstorage:\n  cacheDir: ./cache\n  runDir: ./runs\n")
+	data := []byte("apiVersion: foam-clutch/v1alpha1\nname: test\ncase:\n  path: ./case\nresources:\n  partition: normal\n  nodes: 1\n  tasksPerNode: 1\n  timeLimitMinutes: 5\nsolver:\n  name: simpleFoam\nstorage:\n  cacheDir: ./cache\n  runDir: ./runs\n")
 	if err := os.WriteFile(manifestPath, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// decomposeParDict must agree with 1x1 = 1 rank.
+	if err := os.WriteFile(filepath.Join(caseDir, "system", "decomposeParDict"), []byte("numberOfSubdomains 1;\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.Open(filepath.Join(root, "jobs.db"))
@@ -56,6 +60,18 @@ func TestSubmitStagesPersistsAndBuildsCheckpointScript(t *testing.T) {
 	}
 	if !contains(fake.spec.Script, "scontrol requeue") || !contains(fake.spec.Script, result.RunPath) {
 		t.Fatal("checkpoint script was not configured safely")
+	}
+	if !contains(fake.spec.Script, "blockMesh") || !contains(fake.spec.Script, "decomposePar") {
+		t.Fatal("pipeline script must mesh and decompose before the parallel solver")
+	}
+	if !contains(fake.spec.Script, "#SBATCH --partition=normal") || !contains(fake.spec.Script, "#SBATCH --ntasks=1") {
+		t.Fatal("pipeline script must carry SBATCH headers for the cli backend")
+	}
+	if !contains(fake.spec.Script, "mpirun -np") {
+		t.Fatal("pipeline script must launch via mpirun (this cluster's srun pmix plugin is broken)")
+	}
+	if contains(fake.spec.Script, "srun --mpi=pmix") {
+		t.Fatal("pipeline script must not use srun --mpi=pmix here")
 	}
 	job, err := st.Get(context.Background(), result.ID)
 	if err != nil {

@@ -15,7 +15,7 @@ func TestLoadResolvesRelativePaths(t *testing.T) {
 		}
 	}
 	path := filepath.Join(root, "manifest.yaml")
-	data := []byte("apiVersion: foam-clutch/v1alpha1\nname: test\ncase:\n  path: ./case\nresources:\n  nodes: 1\n  tasksPerNode: 1\n  timeLimitMinutes: 5\nsolver:\n  name: simpleFoam\n")
+	data := []byte("apiVersion: foam-clutch/v1alpha1\nname: test\ncase:\n  path: ./case\nresources:\n  partition: normal\n  nodes: 1\n  tasksPerNode: 1\n  timeLimitMinutes: 5\nsolver:\n  name: simpleFoam\n")
 	if err := os.WriteFile(path, data, 0o640); err != nil {
 		t.Fatal(err)
 	}

@@ -1,46 +1,86 @@
 #!/bin/bash
 {{- /*
   Rendered with Go text/template. Fields:
-    Name, Nodes, PPN, WallTime (HH:MM:SS), CaseDir, Solver, IORanks, FoamBashrc
+    Name, Nodes, PPN, Ranks, WallTime (HH:MM:SS), Partition, Account,
+    CaseDir, Solver, SolverArgs, FoamBashrc
     Container (bool), SIF, BindPaths
   When submitted via slurmrestd, set the equivalent job fields in JobSpec
   (and anything unmodelled via JobSpec.Extra): do not rely on #SBATCH lines
   being parsed there. For the sbatch CLI backend these lines are authoritative.
+  The service generates an equivalent script programmatically; keep the two
+  in sync (mesh -> decompose -> solver -> requeue).
 */}}
 #SBATCH --job-name={{.Name}}
-#SBATCH --nodes={{.Nodes}}
+#SBATCH --partition={{.Partition}}
+{{if .Account}}#SBATCH --account={{.Account}}
+{{end}}#SBATCH --nodes={{.Nodes}}
 #SBATCH --ntasks-per-node={{.PPN}}
+#SBATCH --ntasks={{.Ranks}}
 #SBATCH --time={{.WallTime}}
 #SBATCH --exclusive
 #SBATCH --hint=nomultithread
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@600
+#SBATCH --output={{.CaseDir}}/slurm-%j.out
+#SBATCH --error={{.CaseDir}}/slurm-%j.err
 set -euo pipefail
+echo "=== foam-clutch job: {{.Name}} ==="
+date; echo "nodelist: ${SLURM_NODELIST:-unknown} job: ${SLURM_JOB_ID:-unknown}"
 
-cd {{.CaseDir}}
+set +e +u
+source {{.FoamBashrc}}
+set -e -u
 export OMP_NUM_THREADS=1
-export FOAM_IORANKS='{{.IORanks}}'
 BASHRC={{.FoamBashrc}}
 
 {{if .Container -}}
-# ---- container mode (Apptainer) -------------------------------------------
 SIF={{.SIF}}
 BIND={{.BindPaths}}
 foam_serial() { apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && $*"; }
 foam_mpi()    { srun --mpi=pmix --cpu-bind=cores \
                   apptainer exec --bind "$BIND" "$SIF" bash -c "source $BASHRC && exec $*"; }
 {{- else -}}
-# ---- bare-metal mode (host OpenFOAM) --------------------------------------
 foam_serial() { bash -c "source $BASHRC && $*"; }
-foam_mpi()    { srun --mpi=pmix --cpu-bind=cores bash -c "source $BASHRC && exec $*"; }
+foam_mpi()    { mpirun -np "${NTASKS:-{{.Ranks}}}" bash -c "source $BASHRC && exec $*"; }
 {{- end}}
 
-# Slurm sends USR1 to the batch shell 10 min before walltime: ask OpenFOAM to
-# write and stop cleanly (needs runTimeModifiable true, the default). The
-# Supervisor then resubmits with startFrom latestTime.
-trap 'foam_serial "foamDictionary -entry stopAt -set writeNow system/controlDict"' USR1
+cd {{.CaseDir}}
 
-foam_mpi "{{.Solver}} -parallel -fileHandler collated" > log.solver 2>&1 &
-PID=$!
-wait $PID || true   # returns early if the trap fired
-wait $PID           # real exit status of the solver
+if [ ! -f constant/polyMesh/points ]; then
+  echo "--- blockMesh ---"
+  foam_serial "blockMesh" 2>&1 | tee log.blockMesh
+else
+  echo "--- blockMesh skipped (constant/polyMesh exists) ---"
+fi
+
+NPROC=$(grep -E "^numberOfSubdomains" system/decomposeParDict | grep -o "[0-9]*")
+NTASKS=${SLURM_NTASKS:-{{.Ranks}}}
+if [ "$NPROC" != "$NTASKS" ]; then
+  echo "ERROR: decomposeParDict($NPROC) != ntasks($NTASKS)" >&2
+  exit 1
+fi
+HAVE_PROC=0
+shopt -s nullglob
+PROC_DIRS=(processor*)
+HAVE_PROC=${#PROC_DIRS[@]}
+shopt -u nullglob
+if [ "$HAVE_PROC" != "$NTASKS" ]; then
+  rm -rf processor* 2>/dev/null || true
+  foam_serial "decomposePar" 2>&1 | tee log.decomposePar
+else
+  echo "--- decomposePar skipped ($HAVE_PROC processor dirs) ---"
+fi
+
+trap 'foam_serial "foamDictionary -entry stopAt -set writeNow system/controlDict"; touch .foam-checkpoint-requested' USR1
+foam_serial "foamDictionary -entry startFrom -set latestTime system/controlDict" || true
+
+set +e
+foam_mpi "{{.Solver}} {{.SolverArgs}} -parallel -fileHandler collated" > log.solver 2>&1
+SOLVER_RC=$?
+set -e
+echo "solver exit: $SOLVER_RC"
+tail -n 20 log.solver || true
+if [ -f .foam-checkpoint-requested ] && [ -n "${SLURM_JOB_ID:-}" ]; then
+  scontrol requeue "$SLURM_JOB_ID"
+fi
+exit $SOLVER_RC

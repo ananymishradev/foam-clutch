@@ -84,17 +84,41 @@ func (m Manifest) Validate() error {
 	if filepath.IsAbs(m.Case.Path) == false || m.Case.Path == "." {
 		problems = append(problems, "case.path must resolve to an absolute directory")
 	}
+	if strings.TrimSpace(m.Resources.Partition) == "" {
+		problems = append(problems, "resources.partition is required")
+	}
 	if m.Resources.Nodes < 1 {
 		problems = append(problems, "resources.nodes must be greater than zero")
+	}
+	if m.Resources.Nodes > 64 {
+		problems = append(problems, "resources.nodes must not exceed 64")
 	}
 	if m.Resources.TasksPerNode < 1 {
 		problems = append(problems, "resources.tasksPerNode must be greater than zero")
 	}
+	if m.Resources.TasksPerNode > 128 {
+		problems = append(problems, "resources.tasksPerNode must not exceed 128")
+	}
 	if m.Resources.TimeLimitMinutes < 1 {
 		problems = append(problems, "resources.timeLimitMinutes must be greater than zero")
 	}
+	if m.Resources.TimeLimitMinutes > 2880 {
+		problems = append(problems, "resources.timeLimitMinutes must not exceed 2880")
+	}
 	if m.Solver.Name == "" {
 		problems = append(problems, "solver.name is required")
+	}
+	if m.Solver.Name != "" && !allowedSolver(m.Solver.Name) {
+		problems = append(problems, "solver.name "+m.Solver.Name+" is not in the allow-list (foamRun, simpleFoam, pimpleFoam, pisoFoam, icoFoam, interFoam, interIsoFoam, rhoSimpleFoam, rhoPimpleFoam, buoyantSimpleFoam, buoyantPimpleFoam, reactingFoam)")
+	}
+	if strings.ContainsAny(m.Solver.Name, "/\r\n") {
+		problems = append(problems, "solver.name must be a bare executable name")
+	}
+	for _, a := range m.Solver.Arguments {
+		if strings.ContainsAny(a, "\r\n") {
+			problems = append(problems, "solver.arguments must not contain newlines")
+			break
+		}
 	}
 	if m.Solver.CheckpointSeconds < 0 {
 		problems = append(problems, "solver.checkpointSeconds cannot be negative")
@@ -103,4 +127,14 @@ func (m Manifest) Validate() error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func allowedSolver(name string) bool {
+	switch name {
+	case "foamRun", "simpleFoam", "pimpleFoam", "pisoFoam", "icoFoam",
+		"interFoam", "interIsoFoam", "rhoSimpleFoam", "rhoPimpleFoam",
+		"buoyantSimpleFoam", "buoyantPimpleFoam", "reactingFoam":
+		return true
+	}
+	return false
 }

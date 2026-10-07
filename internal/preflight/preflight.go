@@ -37,6 +37,35 @@ func (r Runner) Run(ctx context.Context, caseDir string) (Report, error) {
 			return walkErr
 		}
 		rel, _ := filepath.Rel(caseDir, path)
+		if rel == "." {
+			return nil
+		}
+		top := rel
+		if i := strings.Index(rel, string(os.PathSeparator)); i >= 0 {
+			top = rel[:i]
+		}
+		// Runtime artefacts and VCS state are never part of the case input.
+		// Skip them entirely (no symlink or directive checks inside).
+		if d.IsDir() {
+			if top == ".git" || top == ".foam-cache" || top == ".foam-runs" {
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(d.Name(), "processor") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if top == ".foam-cache" || top == ".foam-runs" || top == ".git" {
+			return nil
+		}
+		if strings.HasPrefix(rel, "processor") {
+			return nil
+		}
+		// Slurm logs, solver logs, and DB files are artefacts, not input.
+		base := d.Name()
+		if strings.HasPrefix(base, "slurm-") || strings.HasPrefix(base, "log.") || base == "log.solver" || strings.HasSuffix(base, ".db") || strings.HasSuffix(base, ".db-wal") || strings.HasSuffix(base, ".db-shm") {
+			return nil
+		}
 		if d.Type()&os.ModeSymlink != 0 {
 			target, err := filepath.EvalSymlinks(path)
 			if err != nil {
@@ -46,13 +75,15 @@ func (r Runner) Run(ctx context.Context, caseDir string) (Report, error) {
 				report.Findings = append(report.Findings, Finding{"error", rel, "symlink escapes case directory"})
 			}
 		}
-		if d.IsDir() && (d.Name() == ".git" || d.Name() == "processor0") {
-			return filepath.SkipDir
+		// Executable-directive scan applies only to OpenFOAM input
+		// dictionaries under 0/, constant/, system/. Scanning README,
+		// shell scripts, manifests, or Slurm files produces false
+		// positives when docs mention directive names.
+		if !isDictPath(rel) {
+			return nil
 		}
-		if !d.IsDir() {
-			if err := scanFile(path, rel, &report); err != nil {
-				return err
-			}
+		if err := scanFile(path, rel, &report); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -100,4 +131,40 @@ func runTool(ctx context.Context, tool, dir string, report *Report, name string)
 func within(root, target string) bool {
 	rel, err := filepath.Rel(root, target)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// isDictPath reports whether rel is an OpenFOAM input dictionary that must
+// be scanned for executable directives. Only files under 0/, constant/,
+// system/ qualify. Everything else (README, scripts, manifests, logs) is
+// documentation or artefacts and must not trigger findings.
+func isDictPath(rel string) bool {
+	return strings.HasPrefix(rel, "0"+string(os.PathSeparator)) ||
+		strings.HasPrefix(rel, "constant"+string(os.PathSeparator)) ||
+		strings.HasPrefix(rel, "system"+string(os.PathSeparator)) ||
+		rel == "0" || rel == "constant" || rel == "system"
+}
+
+// Subdomains reads system/decomposeParDict and returns numberOfSubdomains.
+// It returns an error when the file is missing or unparsable so callers can
+// fail fast before queue time is spent.
+func Subdomains(caseDir string) (int, error) {
+	raw, err := os.ReadFile(filepath.Join(caseDir, "system", "decomposeParDict"))
+	if err != nil {
+		return 0, fmt.Errorf("read decomposeParDict: %w", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		t := strings.TrimSpace(strings.SplitN(line, "//", 2)[0])
+		if !strings.HasPrefix(t, "numberOfSubdomains") {
+			continue
+		}
+		fields := strings.Fields(t)
+		if len(fields) < 2 {
+			continue
+		}
+		var n int
+		if _, err := fmt.Sscanf(strings.TrimSuffix(fields[1], ";"), "%d", &n); err == nil && n > 0 {
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("numberOfSubdomains not found in system/decomposeParDict")
 }

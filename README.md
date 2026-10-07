@@ -60,12 +60,19 @@ Slurm state supervision and Prometheus metrics
 
 ## Requirements
 
-- Go 1.26 or newer.
-- OpenFOAM available on the execution host or inside the configured runtime.
-- Slurm with `slurmrestd` enabled.
-- A valid Slurm REST API version, such as `v0.0.43`.
-- A Slurm JWT for submission.
-- `srun`, `scontrol`, and the selected OpenFOAM tools available to jobs.
+- Go 1.26 or newer, installed system-wide so `go` is on the default `PATH`:
+  ```bash
+  sudo rm -rf /usr/local/go
+  sudo tar -xzf go1.26.0.linux-amd64.tar.gz -C /usr/local
+  sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  go version  # go version go1.26.0 linux/amd64
+  ```
+- OpenFOAM available on the execution host or inside the configured runtime
+  (this cluster: `/opt/openfoam12/etc/bashrc`, identical on every node).
+- Slurm with `sbatch`/`squeue`/`scontrol` on `PATH` (CLI backend, works
+  without further setup), and/or `slurmrestd` with a valid REST API version
+  (such as `v0.0.43`) plus a Slurm JWT for the REST backend.
+- `mpirun` (OpenMPI) and the selected OpenFOAM tools available to jobs.
 
 The repository also contains `openfoam.def` for building an Apptainer image.
 Container/MPI compatibility must be verified against the target cluster.
@@ -184,7 +191,8 @@ an error when validation fails.
 
 ## Submit a job
 
-Set the Slurm connection values:
+Pick a backend first (see Scheduler backends below). For the REST backend,
+set the Slurm connection values:
 
 ```bash
 export SLURM_REST_URL=http://slurmrestd.example:6820
@@ -193,25 +201,93 @@ export SLURM_USER="$USER"
 export SLURM_JWT="$SLURM_JWT"
 ```
 
-Submit:
-
-```bash
-go run ./cmd/foam-clutch submit \
-  -manifest manifest.yaml \
-  -db foam-clutch.db
-```
-
-Submit and keep polling Slurm:
+Submit (CLI backend shown; needs nothing but Slurm on `PATH`):
 
 ```bash
 go run ./cmd/foam-clutch submit \
   -manifest manifest.yaml \
   -db foam-clutch.db \
+  -backend cli
+```
+
+Submit and keep polling Slurm until the job reaches a terminal state:
+
+```bash
+go run ./cmd/foam-clutch submit \
+  -manifest manifest.yaml \
+  -db foam-clutch.db \
+  -backend cli \
   -watch
 ```
 
 The command returns a local job ID, case hash, run path, cache path, and Slurm
 job ID.
+
+Reconcile the state of an already-submitted job (updates the DB record to
+DONE/FAILED/CANCELLED once Slurm reaches a terminal state):
+
+```bash
+go run ./cmd/foam-clutch watch \
+  -db foam-clutch.db \
+  -id <local-job-id> \
+  -slurm <slurm-job-id>
+```
+
+## Scheduler backends
+
+`submit` and `watch` accept `-backend auto|rest|cli` (default `auto`).
+
+- `rest` talks to `slurmrestd` and needs `SLURM_REST_URL`,
+  `SLURM_API_VERSION`, `SLURM_USER`, and `SLURM_JWT`.
+- `cli` shells out to `sbatch`/`squeue`/`scontrol`/`scancel` and needs no
+  extra configuration.
+- `auto` prefers `rest` when the four REST variables are all set and falls
+  back to `cli` otherwise. Clusters without `slurmrestd` (the common case)
+  work out of the box via `cli`.
+
+## Example: heavySimple on this cluster
+
+```bash
+go run ./cmd/foam-clutch validate -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+go run ./cmd/foam-clutch submit -manifest /home/shared/openfoam/heavySimple/manifest.yaml \
+  -db /home/shared/openfoam/heavySimple/foam-clutch.db -backend cli
+squeue
+tail -f /home/shared/openfoam/heavySimple/.foam-runs/<job-id>/slurm-<slurm-id>.out
+```
+
+The generated job script is a full pipeline: `blockMesh` (skipped when
+`constant/polyMesh` exists) → `decomposePar` (rebuilt when the processor
+count mismatches `nodes × tasksPerNode`) → `mpirun foamRun -parallel
+-fileHandler collated` with a `USR1` `writeNow` checkpoint trap and
+`scontrol requeue`. The manifest's `decomposeParDict` subdomain count is
+validated against the requested ranks before submission, so a mismatch fails
+fast instead of wasting queue time. Only `0/`, `constant/`, and `system/`
+are staged and hashed; docs, scripts, logs, and `.foam-*` state never affect
+the case hash.
+
+## Where Slurm output and error files go
+
+The generated job script requests explicit paths, so locations are
+deterministic:
+
+```bash
+#SBATCH --output=<runDir>/slurm-%j.out
+#SBATCH --error=<runDir>/slurm-%j.err
+```
+
+- **foam-clutch jobs:** `<manifest-dir>/.foam-runs/<local-job-id>/slurm-<slurm-id>.out`
+  and `slurm-<slurm-id>.err`. For heavySimple that is, for example,
+  `/home/shared/openfoam/heavySimple/.foam-runs/<job-id>/slurm-42.out`.
+  The same run directory also holds the solver log (`log.solver`),
+  `log.blockMesh`, `log.decomposePar`, `processor*`, and `foam-clutch.sbatch`
+  (the exact script Slurm executed — resubmit it with `sbatch` to reproduce).
+- **Direct `sbatch run_openfoam.slurm`:** `/home/shared/openfoam/heavySimple/slurm-<JOBID>.out`
+  and `slurm-<JOBID>.err` (absolute paths baked into that script).
+- **Standalone `solver.sbatch.tmpl`:** `<caseDir>/slurm-%j.out` / `.err`,
+  where `<caseDir>` is the template's `CaseDir` field.
+
+Solver residuals live in `<runDir>/log.solver` regardless of backend, so
+`tail -f` that file plus the `slurm-*.out` above for mesh/decompose progress.
 
 The current CLI uses a static `SLURM_JWT` value for simplicity. A production
 deployment should provide a refreshable token callback and should not place
