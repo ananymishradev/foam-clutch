@@ -52,6 +52,8 @@ func main() {
 		err = cancel(ctx, os.Args[2:])
 	case "list":
 		err = listJobs(ctx, os.Args[2:])
+	case "logs":
+		err = logs(ctx, os.Args[2:])
 	case "init":
 		err = initManifest(os.Args[2:])
 	case "serve":
@@ -190,8 +192,8 @@ func run(ctx context.Context, args []string) error {
 }
 
 // tailRunLogs streams new lines from the solver log and the Slurm output
-// file until ctx is done. Missing files are tolerated (they appear once the
-// job starts); offsets reset if a file shrinks.
+// and error files until ctx is done. Missing files are tolerated (they
+// appear once the job starts); offsets reset if a file shrinks.
 func tailRunLogs(ctx context.Context, runPath string, slurmID int, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -200,7 +202,8 @@ func tailRunLogs(ctx context.Context, runPath string, slurmID int, interval time
 		label string
 		path  string
 	}{{"solver", filepath.Join(runPath, "log.solver")},
-		{"slurm", filepath.Join(runPath, fmt.Sprintf("slurm-%d.out", slurmID))}}
+		{"slurm-out", filepath.Join(runPath, fmt.Sprintf("slurm-%d.out", slurmID))},
+		{"slurm-err", filepath.Join(runPath, fmt.Sprintf("slurm-%d.err", slurmID))}}
 	offsets := make([]int64, len(files))
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -493,6 +496,79 @@ func listJobs(ctx context.Context, args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(jobs)
 }
 
+// logs resolves a job's log files from the database so no ID ever has to
+// be pasted into tail -f by hand:
+//
+//	foam-clutch logs -manifest <case>/manifest.yaml -latest          # stream newest job
+//	foam-clutch logs -manifest <case>/manifest.yaml -id <local-id>   # stream one job
+//	tail -f $(foam-clutch logs -manifest <case>/manifest.yaml -latest -follow=false)
+func logs(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "manifest path (sets default -db to <manifest-dir>/foam-clutch.db)")
+	dbPath := fs.String("db", "", "SQLite database path")
+	id := fs.String("id", "", "local job ID (from submit/run)")
+	latest := fs.Bool("latest", false, "use the most recently submitted job")
+	follow := fs.Bool("follow", true, "stream new lines like tail -f (false prints paths only)")
+	interval := fs.Duration("interval", 5*time.Second, "stream poll interval")
+	_ = fs.Parse(args)
+
+	db := strings.TrimSpace(*dbPath)
+	if db == "" {
+		if *manifestPath != "" {
+			db = filepath.Join(filepath.Dir(*manifestPath), "foam-clutch.db")
+		} else {
+			db = "foam-clutch.db"
+		}
+	}
+	if *id == "" && !*latest {
+		return fmt.Errorf("logs requires -id <local-job-id> or -latest")
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	var j store.Job
+	if *latest {
+		jobs, err := st.List(ctx)
+		if err != nil {
+			return err
+		}
+		if len(jobs) == 0 {
+			return fmt.Errorf("no jobs in %s", db)
+		}
+		j = jobs[0]
+	} else {
+		j, err = st.Get(ctx, *id)
+		if err != nil {
+			return err
+		}
+	}
+	paths := logPaths(j)
+	if !*follow {
+		fmt.Println(strings.Join(paths, " "))
+		return nil
+	}
+	log.Printf("job id=%s slurm=%d state=%s run=%s", j.ID, j.SlurmID, j.State, j.RunPath)
+	for _, p := range paths {
+		log.Printf("log: %s", p)
+	}
+	wctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	tailRunLogs(wctx, j.RunPath, j.SlurmID, *interval)
+	return nil
+}
+
+// logPaths returns every log address for a job: the solver log plus the
+// Slurm output and error files Slurm was told to write.
+func logPaths(j store.Job) []string {
+	return []string{
+		filepath.Join(j.RunPath, "log.solver"),
+		filepath.Join(j.RunPath, fmt.Sprintf("slurm-%d.out", j.SlurmID)),
+		filepath.Join(j.RunPath, fmt.Sprintf("slurm-%d.err", j.SlurmID)),
+	}
+}
+
 // initManifest scaffolds a generic manifest for any OpenFOAM project. The
 // solver is an arbitrary executable name (foamRun, simpleFoam, a custom
 // solver); nothing is restricted to a built-in list.
@@ -635,6 +711,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  foam-clutch status -db foam-clutch.db -id <job-id> [-refresh] [-slurm <id>]")
 	fmt.Fprintln(os.Stderr, "  foam-clutch cancel -db foam-clutch.db -id <job-id> [-slurm <id>]")
 	fmt.Fprintln(os.Stderr, "  foam-clutch list -db foam-clutch.db [-state DONE]")
+	fmt.Fprintln(os.Stderr, "  foam-clutch logs -manifest manifest.yaml [-id <job-id> | -latest] [-follow=false]")
 	fmt.Fprintln(os.Stderr, "  foam-clutch init -o manifest.yaml -solver foamRun -case ./case")
 	fmt.Fprintln(os.Stderr, "  foam-clutch serve [-addr :8080] [-db foam-clutch.db]")
 	fmt.Fprintln(os.Stderr, "  foam-clutch version")

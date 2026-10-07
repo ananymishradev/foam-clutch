@@ -357,20 +357,51 @@ state never affect the case hash.
 
 ## Where Slurm output and error files go
 
-The generated job script requests explicit paths, so locations are
-deterministic:
+Every foam-clutch run writes three logs inside its isolated run directory.
+Slurm expands `%j` to the Slurm job ID, so the addresses are:
 
-```bash
-#SBATCH --output=<runDir>/slurm-%j.out
-#SBATCH --error=<runDir>/slurm-%j.err
+```text
+<case>/.foam-runs/<local-job-id>/log.solver      # solver residuals (all ranks)
+<case>/.foam-runs/<local-job-id>/slurm-<slurm-id>.out  # Slurm stdout: mesh, decompose, batch echo
+<case>/.foam-runs/<local-job-id>/slurm-<slurm-id>.err  # Slurm stderr
 ```
 
-- **foam-clutch jobs:** `<manifest-dir>/.foam-runs/<local-job-id>/slurm-<slurm-id>.out`
-  and `slurm-<slurm-id>.err`. For heavySimple that is, for example,
-  `/home/shared/openfoam/heavySimple/.foam-runs/<job-id>/slurm-42.out`.
-  The same run directory also holds the solver log (`log.solver`),
-  `log.blockMesh`, `log.decomposePar`, `processor*`, and `foam-clutch.sbatch`
-  (the exact script Slurm executed — resubmit it with `sbatch` to reproduce).
+Concrete addresses:
+
+```text
+heavySimple:  /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/slurm-<slurm-id>.out
+              /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/slurm-<slurm-id>.err
+              /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/log.solver
+heavyBuoyant: /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/slurm-<slurm-id>.out
+              /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/slurm-<slurm-id>.err
+              /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/log.solver
+```
+
+The same run directory also holds `log.blockMesh`, `log.decomposePar`,
+`processor*`, and `foam-clutch.sbatch` (the exact script Slurm executed —
+resubmit it with `sbatch` to reproduce).
+
+You never need to paste IDs by hand. The `run` command prints all three
+paths at submit time, `-tail` streams them live, and `logs` resolves any
+past job from the database:
+
+```bash
+# stream the newest heavySimple job (no IDs typed):
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest
+
+# stream the newest heavyBuoyant job:
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest
+
+# stream one specific job:
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -id <local-job-id>
+
+# plain tail -f with auto-resolved paths (no IDs typed):
+tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest -follow=false)
+tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest -follow=false)
+```
+
+Other layouts for reference:
+
 - **Direct `sbatch run_openfoam.slurm`:** `/home/shared/openfoam/heavySimple/slurm-<JOBID>.out`
   and `slurm-<JOBID>.err` (absolute paths baked into that script).
 - **Standalone `solver.sbatch.tmpl`:** `<caseDir>/slurm-%j.out` / `.err`,
