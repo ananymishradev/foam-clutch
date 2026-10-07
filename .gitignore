@@ -1,0 +1,18 @@
+# Local run state: never commit databases, caches, or per-job runs.
+*.db
+*.db-shm
+*.db-wal
+.foam-cache/
+.foam-runs/
+slurm-*.out
+slurm-*.err
+log.solver
+log.blockMesh
+log.decomposePar
+log.mesh
+log.post
+log.reconstructPar
+processor*/
+# Build output.
+/foam-clutch
+/tmp/

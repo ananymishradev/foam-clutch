@@ -1,0 +1,44 @@
+# Generic example: any OpenFOAM solver works. The solver name is an arbitrary
+# bare executable (stock or custom-compiled); the runner never branches on it.
+# Copy this file and change solver.name, case.path, and resources.
+apiVersion: foam-clutch/v1alpha1
+name: myCase
+
+case:
+  path: ./case
+  # include: ["Allrun", "constant/triSurface"]  # extra inputs to stage
+
+resources:
+  partition: ""   # empty = cluster default
+  account: ""
+  nodes: 1
+  tasksPerNode: 2
+  timeLimitMinutes: 60
+  # sbatchExtra: ["--gres=gpu:1", "--constraint=ib"]
+
+solver:
+  name: simpleFoam      # or pimpleFoam, buoyantPimpleFoam, myCustomSolver, ...
+  arguments: []         # e.g. ["-noFunctionObjects"]
+  fileHandler: collated # collated, uncollated, none
+  checkpointSeconds: 60 # 0 disables USR1 checkpoint/requeue
+  # container: /images/openfoam.sif  # Apptainer image; empty = host OpenFOAM
+
+mesh:
+  strategy: auto  # auto, blockMesh, custom, none
+  # commands: ["surfaceFeatureExtract", "snappyHexMesh -overwrite"]  # custom strategy
+
+post:
+  reconstruct: false  # run reconstructPar after a clean parallel solve
+  # commands: ["foamPostProcess -func sample -latestTime"]
+
+runtime:
+  foamBashrc: /opt/openfoam12/etc/bashrc  # or $FOAM_BASHRC; auto-detected when omitted
+  threadsPerRank: 1
+  mpi:
+    launcher: mpirun  # mpirun or srun
+    flavour: ""       # srun --mpi value; mpirun ignores it
+    # extraArgs: ["--bind-to", "core"]
+
+storage:
+  cacheDir: ./.foam-cache
+  runDir: ./.foam-runs

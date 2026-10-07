@@ -60,12 +60,19 @@ Slurm state supervision and Prometheus metrics
 
 ## Requirements
 
-- Go 1.26 or newer.
-- OpenFOAM available on the execution host or inside the configured runtime.
-- Slurm with `slurmrestd` enabled.
-- A valid Slurm REST API version, such as `v0.0.43`.
-- A Slurm JWT for submission.
-- `srun`, `scontrol`, and the selected OpenFOAM tools available to jobs.
+- Go 1.26 or newer, installed system-wide so `go` is on the default `PATH`:
+  ```bash
+  sudo rm -rf /usr/local/go
+  sudo tar -xzf go1.26.0.linux-amd64.tar.gz -C /usr/local
+  sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  go version  # go version go1.26.0 linux/amd64
+  ```
+- OpenFOAM available on the execution host or inside the configured runtime
+  (this cluster: `/opt/openfoam12/etc/bashrc`, identical on every node).
+- Slurm with `sbatch`/`squeue`/`scontrol` on `PATH` (CLI backend, works
+  without further setup), and/or `slurmrestd` with a valid REST API version
+  (such as `v0.0.43`) plus a Slurm JWT for the REST backend.
+- `mpirun` (OpenMPI) and the selected OpenFOAM tools available to jobs.
 
 The repository also contains `openfoam.def` for building an Apptainer image.
 Container/MPI compatibility must be verified against the target cluster.
@@ -110,7 +117,18 @@ openfoam.def
 
 ## Manifest
 
-Create a file such as `manifest.yaml`:
+No solver, mesh tool, MPI launcher, or file handler is hard-coded. The same
+schema runs heavySimple (`foamRun` + `incompressibleFluid`), heavyBuoyant
+(`foamRun` + `fluid`), any stock solver (`simpleFoam`, `pimpleFoam`,
+`buoyantPimpleFoam`, ...), and any custom-compiled solver: `solver.name` is
+an arbitrary bare executable, and the batch script is rendered entirely from
+manifest fields. Scaffold one with:
+
+```bash
+go run ./cmd/foam-clutch init -o manifest.yaml -solver foamRun -case ./case
+```
+
+Full schema (`examples/generic.yaml`):
 
 ```yaml
 apiVersion: foam-clutch/v1alpha1
@@ -118,18 +136,37 @@ name: cavity
 
 case:
   path: ./case
+  include: []            # extra top-level inputs to stage (e.g. ["Allrun"])
 
 resources:
-  partition: compute
-  account: research
+  partition: ""         # empty = cluster default
+  account: ""
   nodes: 1
   tasksPerNode: 8
   timeLimitMinutes: 60
+  sbatchExtra: []       # e.g. ["--gres=gpu:1"], appended to SBATCH + REST Extra
 
 solver:
-  name: simpleFoam
+  name: foamRun         # any executable: foamRun, simpleFoam, myCustomSolver, ...
   arguments: []
-  checkpointSeconds: 600
+  fileHandler: collated # collated, uncollated, none
+  checkpointSeconds: 600 # USR1 writeNow N s before walltime; 0 disables
+  # container: /images/openfoam.sif
+
+mesh:
+  strategy: auto        # auto, blockMesh, custom, none
+  # commands: ["snappyHexMesh -overwrite"]
+
+post:
+  reconstruct: false
+  # commands: ["foamPostProcess -func sample"]
+
+runtime:
+  foamBashrc: /opt/openfoam12/etc/bashrc  # or $FOAM_BASHRC; auto-detected
+  threadsPerRank: 1
+  mpi:
+    launcher: mpirun    # mpirun or srun
+    flavour: ""         # srun --mpi value; mpirun ignores it
 
 storage:
   cacheDir: ./.foam-cache
@@ -141,7 +178,7 @@ must contain:
 
 ```text
 case/
-├── 0/
+├── 0/            # or 0.orig (either satisfies preflight)
 ├── constant/
 └── system/
 ```
@@ -153,15 +190,29 @@ Important fields:
 | `apiVersion` | Must be `foam-clutch/v1alpha1`. |
 | `name` | Slurm job name and local job name. |
 | `case.path` | OpenFOAM case directory. |
-| `resources.partition` | Slurm partition. |
+| `case.include` | Extra top-level case files/dirs to stage and hash. |
+| `resources.partition` | Slurm partition (empty = default). |
 | `resources.account` | Slurm accounting account. |
 | `resources.nodes` | Number of nodes. |
 | `resources.tasksPerNode` | MPI tasks per node. |
 | `resources.timeLimitMinutes` | Slurm time limit. |
-| `solver.name` | Solver executable, for example `simpleFoam`. |
+| `resources.sbatchExtra` | Raw `--key[=value]` SBATCH lines (never repeats managed opts). |
+| `solver.name` | Any solver executable, for example `foamRun` or `myCustomSolver`. |
 | `solver.arguments` | Additional solver arguments. |
+| `solver.fileHandler` | `collated`, `uncollated`, or `none`. |
+| `solver.checkpointSeconds` | USR1 lead time; `0` disables checkpoint/requeue. |
+| `mesh.strategy` | `auto`, `blockMesh`, `custom`, or `none`. |
+| `post.reconstruct` | Run `reconstructPar` after a clean parallel solve. |
+| `runtime.foamBashrc` | OpenFOAM env; manifest > `$FOAM_BASHRC` > auto-detect. |
+| `runtime.mpi.launcher` | `mpirun` or `srun`. |
 | `storage.cacheDir` | Content-addressed cache root. |
 | `storage.runDir` | Per-job working directory root. |
+
+Validation also checks the case against the manifest generically: `controlDict`
+`application` must equal the manifest solver (or `foamRun` with any `solver
+<model>;` physics entry), `decomposeParDict` must match `nodes × tasksPerNode`
+for parallel runs, `checkpointSeconds` requires `runTimeModifiable true`, and
+`mesh.strategy` must have a mesh source.
 
 ## Local validation
 
@@ -182,40 +233,186 @@ go run ./cmd/foam-clutch validate -manifest manifest.yaml
 The command prints JSON containing the parsed manifest, preflight report, and
 an error when validation fails.
 
-## Submit a job
+## Run an OpenFOAM project with a single command
 
-Set the Slurm connection values:
+```bash
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+```
+
+That one command validates the manifest and case, stages it into the
+content-addressed cache, materializes an isolated run directory, submits to
+Slurm, and watches until DONE/FAILED/CANCELLED — printing the local ID, Slurm
+ID, run directory, and both log paths. Defaults: `-db` is
+`<manifest-dir>/foam-clutch.db`, `-backend auto`. Add `-tail` to stream
+`log.solver` and `slurm-<id>.out` while watching:
+
+```bash
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml -tail
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -tail
+```
+
+`submit`/`watch`/`status`/`cancel` below are the same pipeline split into
+steps for scripting; `run` is just `validate + submit -watch` in one call.
+
+## Submit a job (step-by-step)
+
+Pick a backend first (see Scheduler backends below). For the REST backend,
+set the Slurm connection values (`SLURM_JWT_FILE` is preferred over
+`SLURM_JWT` because it is re-read on every request, so rotated tokens are
+picked up without a restart; `SLURM_SOCKET` selects Unix-socket transport):
 
 ```bash
 export SLURM_REST_URL=http://slurmrestd.example:6820
 export SLURM_API_VERSION=v0.0.43
 export SLURM_USER="$USER"
-export SLURM_JWT="$SLURM_JWT"
+export SLURM_JWT_FILE="$HOME/.slurm/token"  # or SLURM_JWT for short-lived setups
 ```
 
-Submit:
-
-```bash
-go run ./cmd/foam-clutch submit \
-  -manifest manifest.yaml \
-  -db foam-clutch.db
-```
-
-Submit and keep polling Slurm:
+Submit (CLI backend shown; needs nothing but Slurm on `PATH`):
 
 ```bash
 go run ./cmd/foam-clutch submit \
   -manifest manifest.yaml \
   -db foam-clutch.db \
+  -backend cli
+```
+
+Submit and keep polling Slurm until the job reaches a terminal state:
+
+```bash
+go run ./cmd/foam-clutch submit \
+  -manifest manifest.yaml \
+  -db foam-clutch.db \
+  -backend cli \
   -watch
 ```
 
 The command returns a local job ID, case hash, run path, cache path, and Slurm
 job ID.
 
-The current CLI uses a static `SLURM_JWT` value for simplicity. A production
-deployment should provide a refreshable token callback and should not place
-long-lived credentials in shell history, process listings, or shared logs.
+Reconcile the state of an already-submitted job (updates the DB record to
+DONE/FAILED/CANCELLED once Slurm reaches a terminal state):
+
+```bash
+go run ./cmd/foam-clutch watch \
+  -db foam-clutch.db \
+  -id <local-job-id> \
+  -slurm <slurm-job-id>
+```
+
+One-shot refresh, cancel, and listing:
+
+```bash
+go run ./cmd/foam-clutch status -db foam-clutch.db -id <local-job-id> -refresh
+go run ./cmd/foam-clutch cancel -db foam-clutch.db -id <local-job-id>
+go run ./cmd/foam-clutch list -db foam-clutch.db -state RUNNING
+```
+
+## Scheduler backends
+
+`submit`, `watch`, `status`, and `cancel` accept `-backend auto|rest|cli`
+(default `auto`).
+
+- `rest` talks to `slurmrestd` and needs `SLURM_API_VERSION`, `SLURM_USER`,
+  `SLURM_JWT` or `SLURM_JWT_FILE`, and `SLURM_REST_URL` or `SLURM_SOCKET`.
+- `cli` shells out to `sbatch`/`squeue`/`scontrol`/`sacct`/`scancel` and needs no
+  extra configuration. `sacct` is the last-resort state source for finished
+  jobs once `slurmctld` forgets them (unavailable when accounting storage is
+  disabled, in which case the job is recorded `UNKNOWN` with a bounded retry
+  budget).
+- `auto` prefers `rest` when the REST variables are all set and falls
+  back to `cli` otherwise. Clusters without `slurmrestd` (the common case)
+  work out of the box via `cli`.
+
+## Examples: heavySimple and heavyBuoyant on this cluster
+
+Both cases run through the identical generic path — the only differences are
+the case directory and the physics model declared in `controlDict`
+(`incompressibleFluid` vs `fluid`); the runner executable is `foamRun` in
+both manifests and is never special-cased:
+
+```bash
+go run ./cmd/foam-clutch validate -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+go run ./cmd/foam-clutch validate -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+squeue
+tail -f /home/shared/openfoam/heavySimple/.foam-runs/<job-id>/slurm-<slurm-id>.out
+```
+
+The generated job script is a full pipeline driven by the manifest: mesh
+(`auto` uses `constant/polyMesh` when present, else `blockMesh` when
+`system/blockMeshDict` exists; `custom` runs `mesh.commands`; `none` skips)
+→ `decomposePar` for parallel runs (rebuilt when the processor count
+mismatches `nodes × tasksPerNode`; skipped for serial `ranks=1`) → solver
+`<solver.name> <args> [-parallel] [-fileHandler ...]` via `mpirun` or `srun`
+with a `USR1` `writeNow` checkpoint trap and `scontrol requeue` when
+`checkpointSeconds > 0` → optional `reconstructPar` and `post.commands`.
+The manifest's `decomposeParDict` subdomain count is validated against the
+requested ranks before submission, so a mismatch fails fast instead of wasting
+queue time. Only `0/` (or `0.orig/`), `constant/`, `system/`, plus explicit
+`case.include` tops are staged and hashed; docs, scripts, logs, and `.foam-*`
+state never affect the case hash.
+
+## Where Slurm output and error files go
+
+Every foam-clutch run writes three logs inside its isolated run directory.
+Slurm expands `%j` to the Slurm job ID, so the addresses are:
+
+```text
+<case>/.foam-runs/<local-job-id>/log.solver      # solver residuals (all ranks)
+<case>/.foam-runs/<local-job-id>/slurm-<slurm-id>.out  # Slurm stdout: mesh, decompose, batch echo
+<case>/.foam-runs/<local-job-id>/slurm-<slurm-id>.err  # Slurm stderr
+```
+
+Concrete addresses:
+
+```text
+heavySimple:  /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/slurm-<slurm-id>.out
+              /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/slurm-<slurm-id>.err
+              /home/shared/openfoam/heavySimple/.foam-runs/<local-job-id>/log.solver
+heavyBuoyant: /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/slurm-<slurm-id>.out
+              /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/slurm-<slurm-id>.err
+              /home/shared/openfoam/heavyBuoyant/.foam-runs/<local-job-id>/log.solver
+```
+
+The same run directory also holds `log.blockMesh`, `log.decomposePar`,
+`processor*`, and `foam-clutch.sbatch` (the exact script Slurm executed —
+resubmit it with `sbatch` to reproduce).
+
+You never need to paste IDs by hand. The `run` command prints all three
+paths at submit time, `-tail` streams them live, and `logs` resolves any
+past job from the database:
+
+```bash
+# stream the newest heavySimple job (no IDs typed):
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest
+
+# stream the newest heavyBuoyant job:
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest
+
+# stream one specific job:
+go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -id <local-job-id>
+
+# plain tail -f with auto-resolved paths (no IDs typed):
+tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest -follow=false)
+tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest -follow=false)
+```
+
+Other layouts for reference:
+
+- **Direct `sbatch run_openfoam.slurm`:** `/home/shared/openfoam/heavySimple/slurm-<JOBID>.out`
+  and `slurm-<JOBID>.err` (absolute paths baked into that script).
+- **Standalone `solver.sbatch.tmpl`:** `<caseDir>/slurm-%j.out` / `.err`,
+  where `<caseDir>` is the template's `CaseDir` field.
+
+Solver residuals live in `<runDir>/log.solver` regardless of backend, so
+`tail -f` that file plus the `slurm-*.out` above for mesh/decompose progress.
+
+JWTs are never logged. Prefer `SLURM_JWT_FILE` over `SLURM_JWT` so the token
+is re-read on every request, and do not place long-lived credentials in shell
+history, process listings, or shared logs.
 
 ## Run the service
 
@@ -231,8 +428,10 @@ Available endpoints:
 
 ```text
 GET /healthz   liveness response
+GET /readyz    readiness (checks the database)
 GET /metrics   Prometheus text exposition
-GET /jobs      persisted jobs as JSON
+GET /jobs      persisted jobs as JSON (?state=RUNNING filters)
+GET /version   build version
 ```
 
 Example:
@@ -243,8 +442,9 @@ curl http://localhost:8080/metrics
 curl http://localhost:8080/jobs
 ```
 
-The HTTP service currently exposes health, metrics, and read-only job listing.
-It does not expose anonymous job submission. Add authentication and
+Set `FOAM_CLUTCH_API_TOKEN` to require `Authorization: Bearer <token>` on
+`/jobs`. The HTTP service exposes health, metrics, and read-only job listing
+only. It does not expose anonymous job submission. Add authentication and
 authorization before putting it behind a shared network endpoint.
 
 ## Cache and run directories
@@ -270,17 +470,20 @@ future jobs non-reproducible.
 
 ## Checkpoint and requeue behavior
 
-The generated solver script:
+When `solver.checkpointSeconds > 0`, the generated solver script:
 
-1. Starts the solver under `srun`.
-2. Receives `USR1` before the Slurm time limit.
+1. Starts the solver under `mpirun` or `srun` (per `runtime.mpi`).
+2. Receives `USR1` that many seconds before the Slurm time limit.
 3. Sets `stopAt` to `writeNow`.
 4. Marks the run as checkpoint-requested.
 5. Waits for the solver to exit cleanly.
 6. Calls `scontrol requeue` for the current Slurm job.
 7. Starts from `latestTime` on the next execution.
 
-This requires:
+When `checkpointSeconds: 0`, the `--signal`/`--requeue` directives, the trap,
+and the requeue call are all omitted and the solver runs straight through.
+
+This requires (only when checkpointing is enabled):
 
 - `system/controlDict` to be runtime-modifiable;
 - a valid `foamDictionary` command;

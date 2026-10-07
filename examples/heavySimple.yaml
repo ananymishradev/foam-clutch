@@ -1,0 +1,38 @@
+apiVersion: foam-clutch/v1alpha1
+name: heavySimple
+
+case:
+  path: /home/shared/openfoam/heavySimple
+  # include: ["Allrun"]  # extra top-level case files to stage (optional)
+
+resources:
+  partition: normal
+  account: ""
+  nodes: 2
+  tasksPerNode: 4
+  timeLimitMinutes: 60
+  # sbatchExtra: ["--gres=gpu:1"]  # appended to the batch script, mapped best-effort to REST
+
+solver:
+  name: foamRun          # OpenFOAM 12 runner; physics model (incompressibleFluid) lives in controlDict
+  arguments: []
+  fileHandler: collated  # collated, uncollated, none
+  checkpointSeconds: 600 # USR1 writeNow N seconds before walltime; 0 disables
+
+mesh:
+  strategy: auto  # auto, blockMesh, custom, none
+
+post:
+  reconstruct: false
+  # commands: ["foamPostProcess -func sample"]
+
+runtime:
+  foamBashrc: /opt/openfoam12/etc/bashrc
+  threadsPerRank: 1
+  mpi:
+    launcher: mpirun  # mpirun or srun
+    flavour: ""       # srun --mpi value (pmix, pmi2, openmpi); mpirun ignores it
+
+storage:
+  cacheDir: /home/shared/openfoam/heavySimple/.foam-cache
+  runDir: /home/shared/openfoam/heavySimple/.foam-runs
