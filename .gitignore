@@ -14,5 +14,6 @@ log.post
 log.reconstructPar
 processor*/
 # Build output.
+/clutch
 /foam-clutch
 /tmp/

@@ -77,10 +77,49 @@ Slurm state supervision and Prometheus metrics
 The repository also contains `openfoam.def` for building an Apptainer image.
 Container/MPI compatibility must be verified against the target cluster.
 
+## Install (`clutch` command)
+
+The CLI lives in `cmd/clutch` and installs as `clutch`:
+
+```bash
+go install ./cmd/clutch
+clutch version
+```
+
+Ensure `$(go env GOPATH)/bin` is on `PATH`. This shell has
+`~/.local/bin` on `PATH`, so this also works:
+
+```bash
+cp "$(go env GOPATH)/bin/clutch" ~/.local/bin/clutch
+clutch version
+```
+
+Without installing, the equivalent developer form is:
+
+```bash
+go run ./cmd/clutch version
+```
+
+All examples below use the installed `clutch` command.
+
+## Run it
+
+```bash
+clutch it -manifest manifest.yaml
+```
+
+`it` is a short alias for `run`. These three forms are identical:
+
+```bash
+clutch -manifest manifest.yaml
+clutch it -manifest manifest.yaml
+clutch run -manifest manifest.yaml
+```
+
 ## Project layout
 
 ```text
-cmd/foam-clutch/
+cmd/clutch/
   main.go
   CLI commands and the local HTTP service
 
@@ -125,7 +164,7 @@ an arbitrary bare executable, and the batch script is rendered entirely from
 manifest fields. Scaffold one with:
 
 ```bash
-go run ./cmd/foam-clutch init -o manifest.yaml -solver foamRun -case ./case
+clutch init -o manifest.yaml -solver foamRun -case ./case
 ```
 
 Full schema (`examples/generic.yaml`):
@@ -227,7 +266,7 @@ go test -race ./...
 Validate a case before submitting:
 
 ```bash
-go run ./cmd/foam-clutch validate -manifest manifest.yaml
+clutch validate -manifest manifest.yaml
 ```
 
 The command prints JSON containing the parsed manifest, preflight report, and
@@ -236,8 +275,8 @@ an error when validation fails.
 ## Run an OpenFOAM project with a single command
 
 ```bash
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
 ```
 
 That one command validates the manifest and case, stages it into the
@@ -248,8 +287,8 @@ ID, run directory, and both log paths. Defaults: `-db` is
 `log.solver` and `slurm-<id>.out` while watching:
 
 ```bash
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml -tail
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -tail
+clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml -tail
+clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -tail
 ```
 
 `submit`/`watch`/`status`/`cancel` below are the same pipeline split into
@@ -272,7 +311,7 @@ export SLURM_JWT_FILE="$HOME/.slurm/token"  # or SLURM_JWT for short-lived setup
 Submit (CLI backend shown; needs nothing but Slurm on `PATH`):
 
 ```bash
-go run ./cmd/foam-clutch submit \
+clutch submit \
   -manifest manifest.yaml \
   -db foam-clutch.db \
   -backend cli
@@ -281,7 +320,7 @@ go run ./cmd/foam-clutch submit \
 Submit and keep polling Slurm until the job reaches a terminal state:
 
 ```bash
-go run ./cmd/foam-clutch submit \
+clutch submit \
   -manifest manifest.yaml \
   -db foam-clutch.db \
   -backend cli \
@@ -295,7 +334,7 @@ Reconcile the state of an already-submitted job (updates the DB record to
 DONE/FAILED/CANCELLED once Slurm reaches a terminal state):
 
 ```bash
-go run ./cmd/foam-clutch watch \
+clutch watch \
   -db foam-clutch.db \
   -id <local-job-id> \
   -slurm <slurm-job-id>
@@ -304,9 +343,9 @@ go run ./cmd/foam-clutch watch \
 One-shot refresh, cancel, and listing:
 
 ```bash
-go run ./cmd/foam-clutch status -db foam-clutch.db -id <local-job-id> -refresh
-go run ./cmd/foam-clutch cancel -db foam-clutch.db -id <local-job-id>
-go run ./cmd/foam-clutch list -db foam-clutch.db -state RUNNING
+clutch status -db foam-clutch.db -id <local-job-id> -refresh
+clutch cancel -db foam-clutch.db -id <local-job-id>
+clutch list -db foam-clutch.db -state RUNNING
 ```
 
 ## Scheduler backends
@@ -333,10 +372,10 @@ the case directory and the physics model declared in `controlDict`
 both manifests and is never special-cased:
 
 ```bash
-go run ./cmd/foam-clutch validate -manifest /home/shared/openfoam/heavySimple/manifest.yaml
-go run ./cmd/foam-clutch validate -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
-go run ./cmd/foam-clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+clutch validate -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+clutch validate -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
+clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+clutch run -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml
 squeue
 tail -f /home/shared/openfoam/heavySimple/.foam-runs/<job-id>/slurm-<slurm-id>.out
 ```
@@ -357,7 +396,7 @@ state never affect the case hash.
 
 ## Where Slurm output and error files go
 
-Every foam-clutch run writes three logs inside its isolated run directory.
+Every clutch run writes three logs inside its isolated run directory.
 Slurm expands `%j` to the Slurm job ID, so the addresses are:
 
 ```text
@@ -387,17 +426,17 @@ past job from the database:
 
 ```bash
 # stream the newest heavySimple job (no IDs typed):
-go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest
+clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest
 
 # stream the newest heavyBuoyant job:
-go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest
+clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest
 
 # stream one specific job:
-go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -id <local-job-id>
+clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -id <local-job-id>
 
 # plain tail -f with auto-resolved paths (no IDs typed):
-tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest -follow=false)
-tail -f $(go run ./cmd/foam-clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest -follow=false)
+tail -f $(clutch logs -manifest /home/shared/openfoam/heavySimple/manifest.yaml -latest -follow=false)
+tail -f $(clutch logs -manifest /home/shared/openfoam/heavyBuoyant/manifest.yaml -latest -follow=false)
 ```
 
 Other layouts for reference:
@@ -419,7 +458,7 @@ history, process listings, or shared logs.
 Start the local HTTP service:
 
 ```bash
-go run ./cmd/foam-clutch serve \
+clutch serve \
   -addr :8080 \
   -db foam-clutch.db
 ```

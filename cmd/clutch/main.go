@@ -36,13 +36,20 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// `clutch -manifest m.yaml` (leading flag, no subcommand) defaults to run.
+	if strings.HasPrefix(os.Args[1], "-") {
+		if err := run(ctx, os.Args[1:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	var err error
 	switch os.Args[1] {
 	case "validate":
 		err = validate(ctx, os.Args[2:])
 	case "submit":
 		err = submit(ctx, os.Args[2:])
-	case "run":
+	case "run", "it":
 		err = run(ctx, os.Args[2:])
 	case "watch":
 		err = watch(ctx, os.Args[2:])
@@ -59,7 +66,7 @@ func main() {
 	case "serve":
 		err = serve(ctx, os.Args[2:])
 	case "version":
-		fmt.Printf("foam-clutch %s\n", Version)
+		fmt.Printf("clutch %s\n", Version)
 	default:
 		usage()
 		os.Exit(2)
@@ -87,7 +94,7 @@ func submit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("foam-clutch submit backend=%s manifest=%s", backendName, *manifestPath)
+	log.Printf("clutch submit backend=%s manifest=%s", backendName, *manifestPath)
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		return err
@@ -118,7 +125,7 @@ func submit(ctx context.Context, args []string) error {
 // run is the single command that validates, submits, and watches an
 // OpenFOAM case until Slurm reaches a terminal state:
 //
-//	foam-clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
+//	clutch run -manifest /home/shared/openfoam/heavySimple/manifest.yaml
 //
 // Defaults are chosen so that running from the case directory needs no flags
 // at all (manifest.yaml + foam-clutch.db next to it, CLI backend). It is
@@ -148,7 +155,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("foam-clutch run backend=%s manifest=%s db=%s", backendName, *manifestPath, db)
+	log.Printf("clutch run backend=%s manifest=%s db=%s", backendName, *manifestPath, db)
 	// Fail fast on manifest/case problems before touching the database or
 	// Slurm, so a typo never creates stray state.
 	vs := service.Service{Preflight: preflight.Runner{}}
@@ -369,7 +376,7 @@ func watch(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
-	log.Printf("foam-clutch watch backend=%s id=%s slurm=%d", backendName, *id, *slurmID)
+	log.Printf("clutch watch backend=%s id=%s slurm=%d", backendName, *id, *slurmID)
 	w := supervisor.Supervisor{Scheduler: scheduler, Store: st, Metrics: &telemetry.Metrics{}, PollInterval: *interval}
 	if err := w.Watch(ctx, *id, *slurmID); err != nil {
 		return err
@@ -463,7 +470,7 @@ func cancel(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("foam-clutch cancel backend=%s slurm=%d", backendName, *slurmID)
+	log.Printf("clutch cancel backend=%s slurm=%d", backendName, *slurmID)
 	if err := scheduler.Cancel(ctx, *slurmID); err != nil {
 		return err
 	}
@@ -499,9 +506,9 @@ func listJobs(ctx context.Context, args []string) error {
 // logs resolves a job's log files from the database so no ID ever has to
 // be pasted into tail -f by hand:
 //
-//	foam-clutch logs -manifest <case>/manifest.yaml -latest          # stream newest job
-//	foam-clutch logs -manifest <case>/manifest.yaml -id <local-id>   # stream one job
-//	tail -f $(foam-clutch logs -manifest <case>/manifest.yaml -latest -follow=false)
+//	clutch logs -manifest <case>/manifest.yaml -latest          # stream newest job
+//	clutch logs -manifest <case>/manifest.yaml -id <local-id>   # stream one job
+//	tail -f $(clutch logs -manifest <case>/manifest.yaml -latest -follow=false)
 func logs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
 	manifestPath := fs.String("manifest", "", "manifest path (sets default -db to <manifest-dir>/foam-clutch.db)")
@@ -687,7 +694,7 @@ func serve(ctx context.Context, args []string) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	log.Printf("foam-clutch listening on %s version=%s", *addr, Version)
+	log.Printf("clutch listening on %s version=%s", *addr, Version)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -704,15 +711,17 @@ func withLogging(next http.Handler) http.Handler {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  foam-clutch run -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-tail]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch validate -manifest manifest.yaml")
-	fmt.Fprintln(os.Stderr, "  foam-clutch submit -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-watch]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch watch -db foam-clutch.db -id <job-id> -slurm <slurm-id>")
-	fmt.Fprintln(os.Stderr, "  foam-clutch status -db foam-clutch.db -id <job-id> [-refresh] [-slurm <id>]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch cancel -db foam-clutch.db -id <job-id> [-slurm <id>]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch list -db foam-clutch.db [-state DONE]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch logs -manifest manifest.yaml [-id <job-id> | -latest] [-follow=false]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch init -o manifest.yaml -solver foamRun -case ./case")
-	fmt.Fprintln(os.Stderr, "  foam-clutch serve [-addr :8080] [-db foam-clutch.db]")
-	fmt.Fprintln(os.Stderr, "  foam-clutch version")
+	fmt.Fprintln(os.Stderr, "  clutch -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-tail]")
+	fmt.Fprintln(os.Stderr, "  clutch it -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-tail]")
+	fmt.Fprintln(os.Stderr, "  clutch run -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-tail]")
+	fmt.Fprintln(os.Stderr, "  clutch validate -manifest manifest.yaml")
+	fmt.Fprintln(os.Stderr, "  clutch submit -manifest manifest.yaml [-db foam-clutch.db] [-backend auto|rest|cli] [-watch]")
+	fmt.Fprintln(os.Stderr, "  clutch watch -db foam-clutch.db -id <job-id> -slurm <slurm-id>")
+	fmt.Fprintln(os.Stderr, "  clutch status -db foam-clutch.db -id <job-id> [-refresh] [-slurm <id>]")
+	fmt.Fprintln(os.Stderr, "  clutch cancel -db foam-clutch.db -id <job-id> [-slurm <id>]")
+	fmt.Fprintln(os.Stderr, "  clutch list -db foam-clutch.db [-state DONE]")
+	fmt.Fprintln(os.Stderr, "  clutch logs -manifest manifest.yaml [-id <job-id> | -latest] [-follow=false]")
+	fmt.Fprintln(os.Stderr, "  clutch init -o manifest.yaml -solver foamRun -case ./case")
+	fmt.Fprintln(os.Stderr, "  clutch serve [-addr :8080] [-db foam-clutch.db]")
+	fmt.Fprintln(os.Stderr, "  clutch version")
 }
