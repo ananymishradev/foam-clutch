@@ -1,0 +1,78 @@
+name: Go
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write # release job uploads assets
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go test -race ./...
+      - name: Smoke-test Linux binary
+        run: |
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.Version=${GITHUB_SHA}" \
+            -o clutch ./cmd/clutch
+          ./clutch version
+          ./clutch 2>&1 | head -5
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+      - name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME}" \
+            -o clutch-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/clutch
+          sha256sum clutch-${{ matrix.goos }}-${{ matrix.goarch }} > clutch-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clutch-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            clutch-${{ matrix.goos }}-${{ matrix.goarch }}
+            clutch-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
